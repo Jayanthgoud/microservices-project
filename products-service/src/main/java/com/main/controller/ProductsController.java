@@ -62,6 +62,11 @@ public class ProductsController {
     public int getAvailability(@PathVariable Long id, @PathVariable Integer quantity) {
         return productsService.getAvailability(id, quantity);
     }
+
+    @PutMapping("/{id}/{quantity}/updateAvailability")
+    public void updateAvailability(@PathVariable Long id, @PathVariable Integer quantity) {
+        productsService.updateAvailability(id, quantity);
+    }
     
     
 

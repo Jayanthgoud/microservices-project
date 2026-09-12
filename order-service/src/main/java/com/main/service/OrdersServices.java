@@ -2,12 +2,15 @@ package com.main.service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import com.main.event.OrderCreatedEvent;
 import com.main.feign.ProductsService;
 import com.main.feign.UserService;
+import com.main.kafka.OrderEventProducer;
 import com.main.model.OrderItemModel;
 import com.main.model.OrderModel;
 import com.main.repository.OrderDto;
@@ -24,6 +27,9 @@ public class OrdersServices {
 	@Autowired
 	UserService userService;
 
+	@Autowired
+	OrderEventProducer orderEventProducer;
+
 	public List<OrderModel> getAllOrders() {
 		// TODO Auto-generated method stub
 		return orderDto.findAll();
@@ -35,9 +41,11 @@ public class OrdersServices {
 	}
 
 	public OrderModel createOrder(OrderModel order) {
+		System.out.println("==================================");
 		Integer isAvailable;
 		Double price;
 		Double totalAmount = 0.0;
+		System.out.println("Creating order for user ID: " + order.getUserId());
 		Integer userExists = userService.isUserExists(order.getUserId());
 		if(userExists == 0) {
 			throw new RuntimeException("User ID is required to create an order");
@@ -56,10 +64,19 @@ public class OrdersServices {
 				throw new RuntimeException("Product with id: " + item.getProductId() + " is not available in the requested quantity: " + item.getQuantity());
 			}
 			item.setOrder(order);
+			productsService.updateAvailability(item.getProductId(), item.getQuantity());
 		}
 		order.setItems(items);
 		order.setTotalAmount(totalAmount);
-		return orderDto.save(order);
+		orderDto.save(order);
+		OrderCreatedEvent event = new OrderCreatedEvent(
+				UUID.randomUUID(),
+				order.getId(),
+				order.getUserId(),
+				order.getTotalAmount()
+		);
+		orderEventProducer.publishOrderCreated(event);
+		return order;
 	}
 
 	public OrderModel updateOrder(Long id, String status) {

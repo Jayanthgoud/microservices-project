@@ -18,6 +18,12 @@ public class ProductsServiceFallbackFactory implements FallbackFactory<ProductsS
             public int getAvailability(Long id, Integer quantity) {
                 return 0;
             }
+
+            @Override
+            public void updateAvailability(Long id, Integer quantity) {
+                // TODO Auto-generated method stub
+                throw new UnsupportedOperationException("Unimplemented method 'updateAvailability'");
+            }
         };
     }
 }
