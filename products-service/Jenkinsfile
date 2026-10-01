@@ -1,0 +1,175 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'DEPLOY_BUILD',
+            defaultValue: '',
+            description: 'ECR build number to deploy. Leave empty to deploy the current Jenkins build.'
+        )
+    }
+
+    tools {
+        maven 'maven-3.9'
+    }
+
+    stages {
+
+        stage('Clone') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/Jayanthgoud/microservices-project'
+            }
+        }
+
+        stage('Verify Repository') {
+            steps {
+                sh '''
+                    echo "Repository cloned successfully"
+                    ls -la
+                    pwd
+                '''
+            }
+        }
+
+        stage('Build Jar') {
+            when {
+                expression {
+                    !params.DEPLOY_BUILD?.trim()
+                }
+            }
+
+            steps {
+                dir('products-service') {
+                    sh '''
+                        ls -alrt
+                        mvn clean package -DskipTests
+                        ls -alrt target
+                        pwd
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            when {
+                expression {
+                    !params.DEPLOY_BUILD?.trim()
+                }
+            }
+
+            steps {
+                dir('products-service') {
+                    sh '''
+                        docker build \
+                            -t products-service:build-${BUILD_NUMBER} \
+                            -t products-service:latest .
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image to ECR') {
+            when {
+                expression {
+                    !params.DEPLOY_BUILD?.trim()
+                }
+            }
+
+            steps {
+                sh '''
+                    aws ecr get-login-password --region us-east-1 | \
+                    docker login --username AWS --password-stdin \
+                    215520152570.dkr.ecr.us-east-1.amazonaws.com
+
+                    docker tag products-service:build-${BUILD_NUMBER} \
+                    215520152570.dkr.ecr.us-east-1.amazonaws.com/products-service:build-${BUILD_NUMBER}
+
+                    docker tag products-service:latest \
+                    215520152570.dkr.ecr.us-east-1.amazonaws.com/products-service:latest
+
+                    docker push \
+                    215520152570.dkr.ecr.us-east-1.amazonaws.com/products-service:build-${BUILD_NUMBER}
+
+                    docker push \
+                    215520152570.dkr.ecr.us-east-1.amazonaws.com/products-service:latest
+                '''
+            }
+        }
+
+        stage('Test SSH to Application EC2') {
+            steps {
+                sshagent(['application-ec2-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                        ec2-user@172.31.17.99 \
+                        "echo 'SSH connection successful'; hostname; whoami"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Application EC2') {
+            steps {
+                script {
+                    def deployBuild = params.DEPLOY_BUILD?.trim()
+
+                    if (!deployBuild) {
+                        deployBuild = env.BUILD_NUMBER
+                    }
+
+                    echo "Deploying ECR build-${deployBuild}"
+
+                    sshagent(['application-ec2-key']) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no \
+                            ec2-user@172.31.17.99 '
+
+                            set -e
+
+                            echo "Logging in to ECR..."
+
+                            aws ecr get-login-password --region us-east-1 | \
+                            docker login --username AWS --password-stdin \
+                            215520152570.dkr.ecr.us-east-1.amazonaws.com
+
+                            echo "Pulling build-${deployBuild}..."
+
+                            docker pull \
+                            215520152570.dkr.ecr.us-east-1.amazonaws.com/products-service:build-${deployBuild}
+
+                            echo "Stopping old container..."
+
+                            docker stop products-service || true
+                            docker rm products-service || true
+
+                            echo "Starting products-service..."
+
+                            docker run -d \
+                                --name products-service \
+                                -p 8082:8082 \
+                                -e SPRING_DATASOURCE_URL="jdbc:postgresql://products-db.cqnks84uonij.us-east-1.rds.amazonaws.com:5432/productsDB" \
+                                -e SPRING_DATASOURCE_USERNAME="jayanthgoud" \
+                                -e SPRING_DATASOURCE_PASSWORD="YOUR_RDS_PASSWORD" \
+                                -e SPRING_JPA_HIBERNATE_DDL_AUTO="none" \
+                                215520152570.dkr.ecr.us-east-1.amazonaws.com/products-service:build-${deployBuild}
+
+                            echo "Deployment successful."
+                            echo "Deployed build: ${deployBuild}"
+
+                            docker ps
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Cleaning Jenkins workspace...'
+            deleteDir()
+        }
+    }
+}
