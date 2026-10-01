@@ -1,0 +1,209 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'DEPLOY_BUILD',
+            defaultValue: '',
+            description: 'ECR build number to deploy. Leave empty to deploy the current Jenkins build.'
+        )
+    }
+
+    tools {
+        maven 'maven-3.9'
+    }
+
+    stages {
+
+        stage('Clone') {
+            steps {
+                git branch: 'stage',
+                    url: 'https://github.com/Jayanthgoud/microservices-project'
+            }
+        }
+
+        stage('Load Deployment Properties') {
+            steps {
+                script {
+                    def props = readFile('products-service/deployment.properties')
+                        .readLines()
+                        .findAll { it.trim() && !it.trim().startsWith('#') }
+                        .collectEntries { line ->
+                            def parts = line.split('=', 2)
+                            [(parts[0].trim()): parts[1].trim()]
+                        }
+
+                    env.AWS_REGION = props.AWS_REGION
+                    env.AWS_ACCOUNT_ID = props.AWS_ACCOUNT_ID
+                    env.ECR_REPOSITORY = props.ECR_REPOSITORY
+                    env.APPLICATION_EC2_PRIVATE_IP = props.APPLICATION_EC2_PRIVATE_IP
+                    env.APPLICATION_PORT = props.APPLICATION_PORT
+                    env.RDS_HOST = props.RDS_HOST
+                    env.RDS_PORT = props.RDS_PORT
+                    env.RDS_DATABASE = props.RDS_DATABASE
+                    env.RDS_USERNAME = props.RDS_USERNAME
+
+                    echo "Deployment properties loaded successfully."
+                    echo "AWS Region: ${env.AWS_REGION}"
+                    echo "ECR Repository: ${env.ECR_REPOSITORY}"
+                    echo "Application EC2: ${env.APPLICATION_EC2_PRIVATE_IP}"
+                    echo "Application Port: ${env.APPLICATION_PORT}"
+                    echo "RDS Host: ${env.RDS_HOST}"
+                    echo "RDS Database: ${env.RDS_DATABASE}"
+                }
+            }
+        }
+
+        stage('Verify Repository') {
+            steps {
+                sh '''
+                    echo "Repository cloned successfully"
+                    ls -la
+                    ls -la products-service
+                    pwd
+                '''
+            }
+        }
+
+        stage('Build Jar') {
+            when {
+                expression {
+                    !params.DEPLOY_BUILD?.trim()
+                }
+            }
+
+            steps {
+                dir('products-service') {
+                    sh '''
+                        ls -alrt
+                        mvn clean package -DskipTests
+                        ls -alrt target
+                        pwd
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            when {
+                expression {
+                    !params.DEPLOY_BUILD?.trim()
+                }
+            }
+
+            steps {
+                dir('products-service') {
+                    sh '''
+                        docker build \
+                            -t products-service:build-${BUILD_NUMBER} \
+                            -t products-service:latest .
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image to ECR') {
+            when {
+                expression {
+                    !params.DEPLOY_BUILD?.trim()
+                }
+            }
+
+            steps {
+                sh '''
+                    aws ecr get-login-password --region "$AWS_REGION" | \
+                    docker login --username AWS --password-stdin \
+                    "$ECR_REPOSITORY"
+
+                    docker tag products-service:build-${BUILD_NUMBER} \
+                    "$ECR_REPOSITORY:build-${BUILD_NUMBER}"
+
+                    docker tag products-service:latest \
+                    "$ECR_REPOSITORY:latest"
+
+                    docker push \
+                    "$ECR_REPOSITORY:build-${BUILD_NUMBER}"
+
+                    docker push \
+                    "$ECR_REPOSITORY:latest"
+                '''
+            }
+        }
+
+        stage('Test SSH to Application EC2') {
+            steps {
+                sshagent(['application-ec2-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no \
+                        ec2-user@"$APPLICATION_EC2_PRIVATE_IP" \
+                        "echo 'SSH connection successful'; hostname; whoami"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Application EC2') {
+            steps {
+                script {
+                    def deployBuild = params.DEPLOY_BUILD?.trim()
+
+                    if (!deployBuild) {
+                        deployBuild = env.BUILD_NUMBER
+                    }
+
+                    echo "Deploying ECR build-${deployBuild}"
+
+                    sshagent(['application-ec2-key']) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no \
+                            ec2-user@${env.APPLICATION_EC2_PRIVATE_IP} '
+
+                            set -e
+
+                            echo "Logging in to ECR..."
+
+                            aws ecr get-login-password --region ${env.AWS_REGION} | \
+                            docker login --username AWS --password-stdin \
+                            ${env.ECR_REPOSITORY}
+
+                            echo "Pulling build-${deployBuild}..."
+
+                            docker pull \
+                            ${env.ECR_REPOSITORY}:build-${deployBuild}
+
+                            echo "Stopping old container..."
+
+                            docker stop products-service || true
+                            docker rm products-service || true
+
+                            echo "Starting products-service..."
+
+                            docker run -d \
+                                --name products-service \
+                                -p ${env.APPLICATION_PORT}:${env.APPLICATION_PORT} \
+                                -e SPRING_DATASOURCE_URL="jdbc:postgresql://${env.RDS_HOST}:${env.RDS_PORT}/${env.RDS_DATABASE}" \
+                                -e SPRING_DATASOURCE_USERNAME="${env.RDS_USERNAME}" \
+                                -e SPRING_DATASOURCE_PASSWORD="YOUR_RDS_PASSWORD" \
+                                -e SPRING_JPA_HIBERNATE_DDL_AUTO="none" \
+                                ${env.ECR_REPOSITORY}:build-${deployBuild}
+
+                            echo "Deployment successful."
+                            echo "Deployed build: ${deployBuild}"
+
+                            docker ps
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Cleaning Jenkins workspace...'
+            deleteDir()
+        }
+    }
+}
+
